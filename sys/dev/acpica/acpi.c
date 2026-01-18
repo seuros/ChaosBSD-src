@@ -293,6 +293,19 @@ static char acpi_remove_interface[256];
 TUNABLE_STR("hw.acpi.remove_interface", acpi_remove_interface,
     sizeof(acpi_remove_interface));
 
+/*
+ * Apple Mac Darwin OSI support.
+ *
+ * On Apple hardware, enable Darwin OSI and disable Windows OSI strings
+ * to match Linux behavior. This is required for dual-GPU MacBook Pro
+ * systems (Intel iGPU + AMD/NVIDIA dGPU) where the iGPU is hidden
+ * when the firmware doesn't see Darwin OSI.
+ *
+ * Set to 0 to disable this behavior.
+ */
+static int acpi_apple_darwin_osi = 1;
+TUNABLE_INT("hw.acpi.apple_darwin_osi", &acpi_apple_darwin_osi);
+
 /* Allow users to dump Debug objects without ACPI debugger. */
 static int acpi_debug_objects;
 TUNABLE_INT("debug.acpi.enable_debug_objects", &acpi_debug_objects);
@@ -4900,6 +4913,47 @@ acpi_reset_interfaces(device_t dev)
 				    list.data[i]);
 		}
 		acpi_free_interfaces(&list);
+	}
+
+	/*
+	 * Apple Mac hardware quirk: Enable Darwin OSI.
+	 *
+	 * Apple's ACPI firmware checks _OSI("Darwin") and sets OSYS=10000
+	 * for macOS. Many device methods use OSDW() which checks OSYS==10000
+	 * for macOS-specific behavior including GPU visibility and power
+	 * management.
+	 *
+	 * Linux enables Darwin OSI by default on Apple hardware and disables
+	 * all Windows OSI strings (drivers/acpi/osi.c). Users can override
+	 * with acpi_osi=!Darwin to get Windows-like behavior.
+	 *
+	 * We match Linux behavior: detect Apple via SMBIOS and enable Darwin
+	 * while disabling Windows vendor strings. This makes both GPUs
+	 * visible on dual-GPU MacBook Pro systems (Intel iGPU + AMD dGPU).
+	 *
+	 * User can disable with hw.acpi.apple_darwin_osi=0 in loader.conf.
+	 */
+	if (acpi_apple_darwin_osi) {
+		char *vendor = kern_getenv("smbios.system.maker");
+		if (vendor != NULL) {
+			if (strcmp(vendor, "Apple Inc.") == 0 ||
+			    strcmp(vendor, "Apple Computer, Inc.") == 0) {
+				/* Disable all Windows vendor strings */
+				AcpiUpdateInterfaces(ACPI_DISABLE_ALL_VENDOR_STRINGS);
+				/* Install Darwin */
+				status = AcpiInstallInterface("Darwin");
+				if (ACPI_SUCCESS(status))
+					device_printf(dev,
+					    "Apple hardware: enabled Darwin OSI, "
+					    "disabled Windows OSI strings\n");
+				else if (bootverbose)
+					device_printf(dev,
+					    "Apple hardware: failed to install "
+					    "Darwin OSI: %s\n",
+					    AcpiFormatException(status));
+			}
+			freeenv(vendor);
+		}
 	}
 }
 
