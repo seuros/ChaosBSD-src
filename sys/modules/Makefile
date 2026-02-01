@@ -179,6 +179,7 @@ SUBDIR=	\
 	imgact_binmisc \
 	${_imx} \
 	${_intelspi} \
+	${_intelthermal} \
 	${_io} \
 	${_ioat} \
         ${_ipoib} \
@@ -831,6 +832,8 @@ _hptrr=		hptrr
 _hyperv=	hyperv
 _ichwd=		ichwd
 _ida=		ida
+_intel_pmc_core=	intel_pmc_core
+_intelthermal=	intelthermal
 _intelspi=	intelspi
 _ips=		ips
 _isci=		isci
