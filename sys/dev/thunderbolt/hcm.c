@@ -28,7 +28,6 @@
 
 #include "opt_thunderbolt.h"
 
-/* Host Configuration Manager (HCM) for USB4 and later TB3 */
 #include <sys/types.h>
 #include <sys/param.h>
 #include <sys/systm.h>
@@ -60,6 +59,7 @@
 #include <dev/thunderbolt/hcm_var.h>
 
 static void hcm_cfg_task(void *, int);
+static void hcm_disconnect(struct hcm_softc *);
 
 int
 hcm_attach(struct nhi_softc *nsc)
@@ -78,10 +78,16 @@ hcm_attach(struct nhi_softc *nsc)
 	hcm->nsc = nsc;
 	nsc->hcm = hcm;
 
+	if (NHI_IS_FW_CM(nsc))
+		nhi_ensure_fw_cm_mode(nsc);
+
 	hcm->taskqueue = taskqueue_create("hcm_event", M_NOWAIT,
 	    taskqueue_thread_enqueue, &hcm->taskqueue);
-	if (hcm->taskqueue == NULL)
+	if (hcm->taskqueue == NULL) {
+		nsc->hcm = NULL;
+		free(hcm, M_THUNDERBOLT);
 		return (ENOMEM);
+	}
 	taskqueue_start_threads(&hcm->taskqueue, 1, PI_DISK, "tbhcm%d_tq",
 	    device_get_unit(nsc->dev));
 	TASK_INIT(&hcm->cfg_task, 0, hcm_cfg_task, hcm);
@@ -95,19 +101,123 @@ hcm_detach(struct nhi_softc *nsc)
 	struct hcm_softc *hcm;
 
 	hcm = nsc->hcm;
-	if (hcm->taskqueue)
+	if (hcm == NULL)
+		return (0);
+	if (hcm->taskqueue) {
+		taskqueue_drain(hcm->taskqueue, &hcm->cfg_task);
 		taskqueue_free(hcm->taskqueue);
+	}
+	nsc->hcm = NULL;
+	free(hcm, M_THUNDERBOLT);
 
 	return (0);
+}
+
+static void
+hcm_pci_rescan(struct hcm_softc *hcm)
+{
+	device_t nhi_dev, pci_bus, bridge, parent_bus;
+	device_t *children;
+	int i, nchildren;
+
+	nhi_dev = hcm->dev;
+
+	pci_bus = device_get_parent(nhi_dev);
+	if (pci_bus == NULL)
+		return;
+	bridge = device_get_parent(pci_bus);
+	if (bridge == NULL)
+		return;
+	parent_bus = device_get_parent(bridge);
+	if (parent_bus == NULL)
+		return;
+
+	bus_topo_lock();
+	if (device_is_attached(parent_bus))
+		BUS_RESCAN(parent_bus);
+	bus_topo_unlock();
+
+	if (device_get_children(parent_bus, &children, &nchildren) != 0)
+		return;
+
+	bus_topo_lock();
+	for (i = 0; i < nchildren; i++) {
+		device_t child, *grandchildren;
+		int j, ngrandchildren;
+
+		if (children[i] == bridge)
+			continue;
+
+		if (device_get_children(children[i], &grandchildren,
+		    &ngrandchildren) != 0)
+			continue;
+
+		for (j = 0; j < ngrandchildren; j++) {
+			child = grandchildren[j];
+			if (device_is_attached(child)) {
+				tb_printf(hcm, "rescanning %s\n",
+				    device_get_nameunit(child));
+				BUS_RESCAN(child);
+			}
+		}
+		free(grandchildren, M_TEMP);
+	}
+	bus_topo_unlock();
+	free(children, M_TEMP);
 }
 
 int
 hcm_router_discover(struct hcm_softc *hcm)
 {
 
+	if (hcm->discovery_pending)
+		return (0);
+	hcm->discovery_pending = 1;
 	taskqueue_enqueue(hcm->taskqueue, &hcm->cfg_task);
 
 	return (0);
+}
+
+static void
+hcm_disconnect(struct hcm_softc *hcm)
+{
+	struct router_softc *rsc;
+	devclass_t dc;
+	device_t tbolt;
+	u_int i;
+
+	if (!hcm->connected)
+		return;
+	hcm->connected = 0;
+
+	rsc = hcm->nsc->root_rsc;
+	if (rsc == NULL)
+		return;
+
+	tb_printf(hcm, "TB disconnect: cleaning up downstream routers\n");
+
+	if (rsc->adapters != NULL) {
+		for (i = 0; i <= rsc->max_adap; i++) {
+			if (rsc->adapters[i] != NULL) {
+				if (tb_router_detach(rsc->adapters[i]) != 0)
+					tb_printf(hcm,
+					    "TB disconnect: adapter %u busy, keeping topology entry\n",
+					    i);
+			}
+		}
+	}
+
+	dc = devclass_find("tbolt");
+	if (dc != NULL) {
+		tbolt = devclass_get_device(dc, device_get_unit(hcm->dev));
+		if (tbolt != NULL) {
+			tb_printf(hcm, "TB disconnect: removing %s\n",
+			    device_get_nameunit(tbolt));
+			bus_topo_lock();
+			device_delete_child(device_get_parent(tbolt), tbolt);
+			bus_topo_unlock();
+		}
+	}
 }
 
 static void
@@ -124,8 +234,18 @@ hcm_cfg_task(void *arg, int pending)
 	u_int error, i, offset;
 
 	hcm = (struct hcm_softc *)arg;
+	hcm->discovery_pending = 0;
 
 	tb_debug(hcm, DBG_HCM|DBG_EXTRA, "hcm_cfg_task called\n");
+
+	if (NHI_IS_FW_CM(hcm->nsc))
+		nhi_ensure_fw_cm_mode(hcm->nsc);
+
+	if (hcm->nsc->fw_safe_mode) {
+		tb_debug(hcm, DBG_HCM,
+		    "Firmware in safe mode, skipping discovery\n");
+		return;
+	}
 
 	buf = malloc(8 * 4, M_THUNDERBOLT, M_NOWAIT|M_ZERO);
 	if (buf == NULL) {
@@ -136,7 +256,8 @@ hcm_cfg_task(void *arg, int pending)
 	rsc = hcm->nsc->root_rsc;
 	error = tb_config_router_read(rsc, 0, 5, buf);
 	if (error != 0) {
-		free(buf, M_NHI);
+		free(buf, M_THUNDERBOLT);
+		hcm_disconnect(hcm);
 		return;
 	}
 
@@ -209,15 +330,30 @@ hcm_cfg_task(void *arg, int pending)
 		    CAP_LANE_STATE_CL0) {
 			tb_route_t newr;
 
-			newr.hi = rsc->route.hi;
-			newr.lo = rsc->route.lo | (i << rsc->depth * 8);
+			newr = TB_CHILD_ROUTE(rsc, i);
 
 			tb_printf(hcm, "want to add router at 0x%08x%08x\n",
 			    newr.hi, newr.lo);
 			error = tb_router_attach(rsc, newr);
 			tb_printf(rsc, "tb_router_attach returned %d\n", error);
+			if (error == 0)
+				hcm->connected = 1;
+		} else if (rsc->adapters != NULL && i <= rsc->max_adap &&
+		    rsc->adapters[i] != NULL) {
+			tb_printf(hcm, "TB disconnect on adapter %d\n", i);
+			error = tb_router_detach(rsc->adapters[i]);
+			if (error != 0)
+				tb_printf(hcm,
+				    "Failed to detach router on adapter %d: %d\n",
+				    i, error);
 		}
 	}
 
 	free(buf, M_THUNDERBOLT);
+
+	if (hcm->nsc->firmware_managed)
+		tb_tunnel_discover_dp(rsc);
+
+	if (hcm->connected)
+		hcm_pci_rescan(hcm);
 }
