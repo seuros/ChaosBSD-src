@@ -962,6 +962,7 @@ fwcam_post_explore(void *arg)
 			sc->fwdev = fwdev;
 			sc->cmd_hi = 0xffff;
 			sc->cmd_lo = 0xf0000000 | (cmd_base << 2);
+			sc->iso_speed = min(fwdev->speed, FWSPD_S400);
 
 			FWCAM_UNLOCK(sc);
 			err = taskqueue_enqueue(taskqueue_thread,
