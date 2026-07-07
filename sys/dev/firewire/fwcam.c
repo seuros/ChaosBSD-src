@@ -128,6 +128,9 @@ fwcam_read_quadlet(struct fwcam_softc *sc, uint32_t offset, uint32_t *val)
 static int
 fwcam_write_quadlet(struct fwcam_softc *sc, uint32_t offset, uint32_t val)
 {
+	struct firewire_comm *fc = sc->fd.fc;
+	struct fw_xfer *xfer;
+	struct fw_pkt *fp;
 	uint16_t dst;
 	uint8_t spd;
 	int err;
@@ -141,11 +144,37 @@ fwcam_write_quadlet(struct fwcam_softc *sc, uint32_t offset, uint32_t val)
 	spd = min(sc->fwdev->speed, FWSPD_S400);
 	FWCAM_UNLOCK(sc);
 
-	err = fw_write_quadlet(sc->fd.fc, M_FWCAM, dst, spd,
-	    sc->cmd_hi, sc->cmd_lo + offset, val);
-	if (err)
-		FWCAM_DEBUG(1, "write_quadlet: offset=0x%x err=%d\n",
+	xfer = fw_xfer_alloc_buf(M_FWCAM, 0, 0);
+	if (xfer == NULL)
+		return (ENOMEM);
+
+	xfer->send.spd = spd;
+	xfer->fc = fc;
+	xfer->hand = fw_xferwake;
+
+	fp = &xfer->send.hdr;
+	fp->mode.wreqq.tcode = FWTCODE_WREQQ;
+	fp->mode.wreqq.dst = dst;
+	fp->mode.wreqq.dest_hi = sc->cmd_hi;
+	fp->mode.wreqq.dest_lo = sc->cmd_lo + offset;
+	fp->mode.wreqq.data = htonl(val);
+
+	err = fw_xfer_request_wait(fc, xfer, 2 * hz);
+	if (err != 0) {
+		FWCAM_DEBUG(1, "write_quadlet: offset=0x%x timeout/err=%d\n",
 		    offset, err);
+		goto out;
+	}
+
+	if (xfer->resp != 0 ||
+	    xfer->recv.hdr.mode.wres.rtcode != FWRCODE_COMPLETE) {
+		FWCAM_DEBUG(0, "write_quadlet: offset=0x%x val=0x%x "
+		    "resp=%d rtcode=%d\n", offset, val,
+		    xfer->resp, xfer->recv.hdr.mode.wres.rtcode);
+		err = (xfer->resp >= 4 && xfer->resp <= 6) ? EBUSY : EIO;
+	}
+out:
+	fw_xfer_free_buf(xfer);
 	return (err);
 }
 
@@ -406,6 +435,43 @@ fwcam_iso_start(struct fwcam_softc *sc)
 	sc->frame_ready = 0;
 	sc->frame_dropped = 0;
 
+	/* IIDC spec s3.1: set video mode registers before ISO enable */
+	err = fwcam_write_quadlet(sc, IIDC_CUR_V_FORMAT,
+	    (uint32_t)sc->cur_format << 29);
+	if (err) {
+		device_printf(sc->fd.dev,
+		    "failed to set CUR_V_FORMAT: %d\n", err);
+		goto fail;
+	}
+	err = fwcam_write_quadlet(sc, IIDC_CUR_V_MODE,
+	    (uint32_t)sc->cur_mode << 29);
+	if (err) {
+		device_printf(sc->fd.dev,
+		    "failed to set CUR_V_MODE: %d\n", err);
+		goto fail;
+	}
+	err = fwcam_write_quadlet(sc, IIDC_CUR_V_FRM_RATE,
+	    (uint32_t)sc->cur_framerate << 29);
+	if (err) {
+		device_printf(sc->fd.dev,
+		    "failed to set CUR_V_FRM_RATE: %d\n", err);
+		goto fail;
+	}
+
+	/* Check Vmode_Error_Status - camera rejects ISO_EN on error */
+	err = fwcam_read_quadlet(sc, IIDC_VMODE_ERR_STATUS, &val);
+	if (err == 0 && (val & (1 << 31))) {
+		device_printf(sc->fd.dev,
+		    "Vmode_Error_Status set: format=%d mode=%d rate=%d "
+		    "speed=%d\n", sc->cur_format, sc->cur_mode,
+		    sc->cur_framerate, sc->iso_speed);
+		err = EINVAL;
+		goto fail;
+	}
+
+	/* Let camera settle after mode change */
+	pause("fwcamm", hz / 10);
+
 	val = ((uint32_t)sc->iso_channel << IIDC_ISO_CH_SHIFT) |
 	    ((uint32_t)sc->iso_speed << IIDC_ISO_SPEED_SHIFT);
 	err = fwcam_write_quadlet(sc, IIDC_ISO_CHANNEL, val);
@@ -415,11 +481,23 @@ fwcam_iso_start(struct fwcam_softc *sc)
 		goto fail;
 	}
 
-	err = fwcam_write_quadlet(sc, IIDC_ISO_EN, IIDC_ISO_EN_ON);
-	if (err) {
-		device_printf(sc->fd.dev,
-		    "failed to enable ISO: %d\n", err);
-		goto fail;
+	{
+		int retries;
+
+		for (retries = 0; retries < 10; retries++) {
+			err = fwcam_write_quadlet(sc, IIDC_ISO_EN,
+			    IIDC_ISO_EN_ON);
+			if (err != EBUSY)
+				break;
+			FWCAM_DEBUG(0, "ISO_EN busy, retry %d/10\n",
+			    retries + 1);
+			pause("fwcamb", hz / 4);
+		}
+		if (err) {
+			device_printf(sc->fd.dev,
+			    "failed to enable ISO: %d\n", err);
+			goto fail;
+		}
 	}
 
 	err = fc->irx_enable(fc, dma_ch);

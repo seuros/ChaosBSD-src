@@ -53,6 +53,7 @@
 #define IIDC_ONE_SHOT		0x61C
 #define IIDC_MEM_SAVE_CH	0x620
 #define IIDC_CUR_MEM_CH		0x624
+#define IIDC_VMODE_ERR_STATUS	0x628
 
 /* Section 1.7 - Status and control register for features */
 #define IIDC_BRIGHTNESS		0x800
