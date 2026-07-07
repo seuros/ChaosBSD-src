@@ -225,6 +225,8 @@ struct fwcam_softc {
 	uint32_t		basic_func;	/* BASIC_FUNC_INQ */
 	uint32_t		features_hi;	/* FEATURE_HI_INQ */
 	uint32_t		features_lo;	/* FEATURE_LO_INQ */
+	uint32_t		modes[8];	/* V_MODE_INQ per format */
+	uint32_t		rates[8][8];	/* V_RATE_INQ per format/mode */
 
 	/* Current settings */
 	uint8_t			cur_format;

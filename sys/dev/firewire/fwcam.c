@@ -173,7 +173,7 @@ fwcam_format_name(int format)
 static int
 fwcam_read_capabilities(struct fwcam_softc *sc)
 {
-	int err;
+	int err, f, m;
 
 	err = fwcam_read_quadlet(sc, IIDC_V_FORMAT_INQ, &sc->formats);
 	if (err) {
@@ -187,6 +187,30 @@ fwcam_read_capabilities(struct fwcam_softc *sc)
 		device_printf(sc->fd.dev,
 		    "failed to read BASIC_FUNC_INQ: %d\n", err);
 		return (err);
+	}
+
+	/* Read mode and rate inquiry registers for each supported format */
+	for (f = 0; f < 8; f++) {
+		if (!(sc->formats & (1 << (31 - f)))) {
+			sc->modes[f] = 0;
+			continue;
+		}
+		err = fwcam_read_quadlet(sc, IIDC_V_MODE_INQ(f),
+		    &sc->modes[f]);
+		if (err) {
+			sc->modes[f] = 0;
+			continue;
+		}
+		for (m = 0; m < 8; m++) {
+			if (!(sc->modes[f] & (1 << (31 - m)))) {
+				sc->rates[f][m] = 0;
+				continue;
+			}
+			err = fwcam_read_quadlet(sc, IIDC_V_RATE_INQ(f, m),
+			    &sc->rates[f][m]);
+			if (err)
+				sc->rates[f][m] = 0;
+		}
 	}
 
 	err = fwcam_read_quadlet(sc, IIDC_FEATURE_HI_INQ, &sc->features_hi);
@@ -815,9 +839,12 @@ fwcam_cdev_ioctl(struct cdev *dev, u_long cmd, caddr_t data,
 		if (mode->format > 7 || mode->mode > 7 || mode->framerate > 7)
 			return (EINVAL);
 
-		if (mode->format != IIDC_FMT_VGA)
-			return (EINVAL);
 		if (!(sc->formats & (1 << (31 - mode->format))))
+			return (EINVAL);
+		if (!(sc->modes[mode->format] & (1 << (31 - mode->mode))))
+			return (EINVAL);
+		if (!(sc->rates[mode->format][mode->mode] &
+		    (1 << (31 - mode->framerate))))
 			return (EINVAL);
 
 		FWCAM_LOCK(sc);
