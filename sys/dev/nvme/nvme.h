@@ -570,6 +570,8 @@ enum nvme_psdt {
 #define NVME_NS_DATA_FLBAS_FORMAT_MASK			(0xF)
 #define NVME_NS_DATA_FLBAS_EXTENDED_SHIFT		(4)
 #define NVME_NS_DATA_FLBAS_EXTENDED_MASK		(0x1)
+#define NVME_NS_DATA_FLBAS_FORMAT_MSB_SHIFT		(5)
+#define NVME_NS_DATA_FLBAS_FORMAT_MSB_MASK		(0x3)
 
 /** metadata capabilities */
 /* metadata can be transferred as part of data prp list */
@@ -2093,6 +2095,18 @@ void	nvme_ns_trim_cmd(struct nvme_command *cmd, uint32_t nsid,
 extern int nvme_use_nvd;
 
 #endif /* _KERNEL */
+
+static inline uint8_t
+nvme_ns_data_format_index(const struct nvme_namespace_data *nsdata)
+{
+	uint8_t fmt;
+
+	fmt = NVMEV(NVME_NS_DATA_FLBAS_FORMAT, nsdata->flbas);
+	/* FIDXU is only valid with more than 16 LBA formats. */
+	if (nsdata->nlbaf >= 16)
+		fmt |= NVMEV(NVME_NS_DATA_FLBAS_FORMAT_MSB, nsdata->flbas) << 4;
+	return (fmt);
+}
 
 /* Endianess conversion functions for NVMe structs */
 static inline
