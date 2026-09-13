@@ -263,6 +263,7 @@ struct nvme_controller {
 	struct resource		*msix_pba_resource;
 
 	int			msi_count;
+	bool			is_msix;
 	uint32_t		enable_aborts;
 	int			outstanding_aborts;
 
