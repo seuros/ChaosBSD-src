@@ -264,6 +264,7 @@ struct nvme_controller {
 
 	int			msi_count;
 	uint32_t		enable_aborts;
+	int			outstanding_aborts;
 
 	uint32_t		num_io_queues;
 	uint32_t		max_hw_pend_io;
